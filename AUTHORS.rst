@@ -12,3 +12,5 @@ If you contributed to pymorphy2, please add yourself to this list
 
 Many people contributed to pymorphy2 predecessor, pymorphy; they are
 listed here: https://github.com/kmike/pymorphy/blob/master/AUTHORS.rst
+
+ьььь
