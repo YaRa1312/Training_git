@@ -7,7 +7,7 @@ def ask (a, b):
             if answer=="Yes" or answer=="No":
                 break
             if answer == '2':
-                print('Dimka molodets cemau')
+                print('Dimka molodets')
             break
         if answer == "Yes":
             ask ((a+b)//2+1, b)
