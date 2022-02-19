@@ -10,4 +10,4 @@ def ask (a, b):
             ask ((a+b)//2+1, b)
         else:
             ask (a, (a+b)//2)
-ask (1,100)
+ask (1,2)
