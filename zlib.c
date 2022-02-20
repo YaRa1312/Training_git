@@ -1,431 +1,602 @@
-/*
-   +----------------------------------------------------------------------+
-   | Copyright (c) The PHP Group                                          |
-   +----------------------------------------------------------------------+
-   | This source file is subject to version 3.01 of the PHP license,      |
-   | that is bundled with this package in the file LICENSE, and is        |
-   | available through the world-wide-web at the following url:           |
-   | http://www.php.net/license/3_01.txt                                  |
-   | If you did not receive a copy of the PHP license and are unable to   |
-   | obtain it through the world-wide-web, please send a note to          |
-   | license@php.net so we can mail you a copy immediately.               |
-   +----------------------------------------------------------------------+
-   | Authors: Rasmus Lerdorf <rasmus@lerdorf.on.ca>                       |
-   |          Stefan Röhrich <sr@linux.de>                                |
-   |          Zeev Suraski <zeev@php.net>                                 |
-   |          Jade Nicoletti <nicoletti@nns.ch>                           |
-   |          Michael Wallner <mike@php.net>                              |
-   +----------------------------------------------------------------------+
+/* example.c -- usage example of the zlib compression library
+ * Copyright (C) 1995-2006, 2011, 2016 Jean-loup Gailly
+ * For conditions of distribution and use, see copyright notice in zlib.h
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
+/* @(#) $Id$ */
+
+#include "zlib.h"
+#include <stdio.h>
+
+#ifdef STDC
+#  include <string.h>
+#  include <stdlib.h>
 #endif
 
-#include "php.h"
-#include "SAPI.h"
-#include "php_ini.h"
-#include "ext/standard/info.h"
-#include "ext/standard/php_string.h"
-#include "php_zlib.h"
-#include "zlib_arginfo.h"
-#include "Zend/zend_interfaces.h"
+#if defined(VMS) || defined(RISCOS)
+#  define TESTFILE "foo-gz"
+#else
+#  define TESTFILE "foo.gz"
+#endif
 
-/*
- * zlib include files can define the following preprocessor defines which rename
- * the corresponding PHP functions to gzopen64, gzseek64 and gztell64 and thereby
- * breaking some software, most notably PEAR's Archive_Tar, which halts execution
- * without error message on gzip compressed archives.
- *
- * This only seems to happen on 32bit systems with large file support.
+#define CHECK_ERR(err, msg) { \
+    if (err != Z_OK) { \
+        fprintf(stderr, "%s error: %d\n", msg, err); \
+        exit(1); \
+    } \
+}
+
+static z_const char hello[] = "hello, hello!";
+/* "hello world" would be more standard, but the repeated "hello"
+ * stresses the compression code better, sorry...
  */
-#undef gzopen
-#undef gzseek
-#undef gztell
 
-ZEND_DECLARE_MODULE_GLOBALS(zlib)
+static const char dictionary[] = "hello";
+static uLong dictId;    /* Adler32 value of the dictionary */
 
-/* InflateContext class */
+void test_deflate       OF((Byte *compr, uLong comprLen));
+void test_inflate       OF((Byte *compr, uLong comprLen,
+                            Byte *uncompr, uLong uncomprLen));
+void test_large_deflate OF((Byte *compr, uLong comprLen,
+                            Byte *uncompr, uLong uncomprLen));
+void test_large_inflate OF((Byte *compr, uLong comprLen,
+                            Byte *uncompr, uLong uncomprLen));
+void test_flush         OF((Byte *compr, uLong *comprLen));
+void test_sync          OF((Byte *compr, uLong comprLen,
+                            Byte *uncompr, uLong uncomprLen));
+void test_dict_deflate  OF((Byte *compr, uLong comprLen));
+void test_dict_inflate  OF((Byte *compr, uLong comprLen,
+                            Byte *uncompr, uLong uncomprLen));
+int  main               OF((int argc, char *argv[]));
 
-zend_class_entry *inflate_context_ce;
-static zend_object_handlers inflate_context_object_handlers;
 
-static inline php_zlib_context *inflate_context_from_obj(zend_object *obj) {
-	return (php_zlib_context *)((char *)(obj) - XtOffsetOf(php_zlib_context, std));
-}
+#ifdef Z_SOLO
 
-#define Z_INFLATE_CONTEXT_P(zv) inflate_context_from_obj(Z_OBJ_P(zv))
+void *myalloc OF((void *, unsigned, unsigned));
+void myfree OF((void *, void *));
 
-static zend_object *inflate_context_create_object(zend_class_entry *class_type) {
-	php_zlib_context *intern = zend_object_alloc(sizeof(php_zlib_context), class_type);
-
-	zend_object_std_init(&intern->std, class_type);
-	object_properties_init(&intern->std, class_type);
-	intern->std.handlers = &inflate_context_object_handlers;
-
-	return &intern->std;
-}
-
-static zend_function *inflate_context_get_constructor(zend_object *object) {
-	zend_throw_error(NULL, "Cannot directly construct InflateContext, use inflate_init() instead");
-	return NULL;
-}
-
-static void inflate_context_free_obj(zend_object *object)
+void *myalloc(q, n, m)
+    void *q;
+    unsigned n, m;
 {
-	php_zlib_context *intern = inflate_context_from_obj(object);
-
-	if (intern->inflateDict) {
-		efree(intern->inflateDict);
-	}
-	inflateEnd(&intern->Z);
-
-	zend_object_std_dtor(&intern->std);
-}
-/* }}} */
-
-/* DeflateContext class */
-
-zend_class_entry *deflate_context_ce;
-static zend_object_handlers deflate_context_object_handlers;
-
-static inline php_zlib_context *deflate_context_from_obj(zend_object *obj) {
-	return (php_zlib_context *)((char *)(obj) - XtOffsetOf(php_zlib_context, std));
+    (void)q;
+    return calloc(n, m);
 }
 
-#define Z_DEFLATE_CONTEXT_P(zv) deflate_context_from_obj(Z_OBJ_P(zv))
-
-static zend_object *deflate_context_create_object(zend_class_entry *class_type) {
-	php_zlib_context *intern = zend_object_alloc(sizeof(php_zlib_context), class_type);
-
-	zend_object_std_init(&intern->std, class_type);
-	object_properties_init(&intern->std, class_type);
-	intern->std.handlers = &deflate_context_object_handlers;
-
-	return &intern->std;
-}
-
-static zend_function *deflate_context_get_constructor(zend_object *object) {
-	zend_throw_error(NULL, "Cannot directly construct DeflateContext, use deflate_init() instead");
-	return NULL;
-}
-
-static void deflate_context_free_obj(zend_object *object)
+void myfree(void *q, void *p)
 {
-	php_zlib_context *intern = deflate_context_from_obj(object);
-
-	deflateEnd(&intern->Z);
-
-	zend_object_std_dtor(&intern->std);
+    (void)q;
+    free(p);
 }
-/* }}} */
 
-/* {{{ Memory management wrappers */
+static alloc_func zalloc = myalloc;
+static free_func zfree = myfree;
 
-static voidpf php_zlib_alloc(voidpf opaque, uInt items, uInt size)
+#else /* !Z_SOLO */
+
+static alloc_func zalloc = (alloc_func)0;
+static free_func zfree = (free_func)0;
+
+void test_compress      OF((Byte *compr, uLong comprLen,
+                            Byte *uncompr, uLong uncomprLen));
+void test_gzio          OF((const char *fname,
+                            Byte *uncompr, uLong uncomprLen));
+
+/* ===========================================================================
+ * Test compress() and uncompress()
+ */
+void test_compress(compr, comprLen, uncompr, uncomprLen)
+    Byte *compr, *uncompr;
+    uLong comprLen, uncomprLen;
 {
-	return (voidpf)safe_emalloc(items, size, 0);
+    int err;
+    uLong len = (uLong)strlen(hello)+1;
+
+    err = compress(compr, &comprLen, (const Bytef*)hello, len);
+    CHECK_ERR(err, "compress");
+
+    strcpy((char*)uncompr, "garbage");
+
+    err = uncompress(uncompr, &uncomprLen, compr, comprLen);
+    CHECK_ERR(err, "uncompress");
+
+    if (strcmp((char*)uncompr, hello)) {
+        fprintf(stderr, "bad uncompress\n");
+        exit(1);
+    } else {
+        printf("uncompress(): %s\n", (char *)uncompr);
+    }
 }
 
-static void php_zlib_free(voidpf opaque, voidpf address)
+/* ===========================================================================
+ * Test read/write of .gz files
+ */
+void test_gzio(fname, uncompr, uncomprLen)
+    const char *fname; /* compressed file name */
+    Byte *uncompr;
+    uLong uncomprLen;
 {
-	efree((void*)address);
-}
-/* }}} */
+#ifdef NO_GZCOMPRESS
+    fprintf(stderr, "NO_GZCOMPRESS -- gz* functions cannot compress\n");
+#else
+    int err;
+    int len = (int)strlen(hello)+1;
+    gzFile file;
+    z_off_t pos;
 
-/* {{{ php_zlib_output_conflict_check() */
-static int php_zlib_output_conflict_check(const char *handler_name, size_t handler_name_len)
+    file = gzopen(fname, "wb");
+    if (file == NULL) {
+        fprintf(stderr, "gzopen error\n");
+        exit(1);
+    }
+    gzputc(file, 'h');
+    if (gzputs(file, "ello") != 4) {
+        fprintf(stderr, "gzputs err: %s\n", gzerror(file, &err));
+        exit(1);
+    }
+    if (gzprintf(file, ", %s!", "hello") != 8) {
+        fprintf(stderr, "gzprintf err: %s\n", gzerror(file, &err));
+        exit(1);
+    }
+    gzseek(file, 1L, SEEK_CUR); /* add one zero byte */
+    gzclose(file);
+
+    file = gzopen(fname, "rb");
+    if (file == NULL) {
+        fprintf(stderr, "gzopen error\n");
+        exit(1);
+    }
+    strcpy((char*)uncompr, "garbage");
+
+    if (gzread(file, uncompr, (unsigned)uncomprLen) != len) {
+        fprintf(stderr, "gzread err: %s\n", gzerror(file, &err));
+        exit(1);
+    }
+    if (strcmp((char*)uncompr, hello)) {
+        fprintf(stderr, "bad gzread: %s\n", (char*)uncompr);
+        exit(1);
+    } else {
+        printf("gzread(): %s\n", (char*)uncompr);
+    }
+
+    pos = gzseek(file, -8L, SEEK_CUR);
+    if (pos != 6 || gztell(file) != pos) {
+        fprintf(stderr, "gzseek error, pos=%ld, gztell=%ld\n",
+                (long)pos, (long)gztell(file));
+        exit(1);
+    }
+
+    if (gzgetc(file) != ' ') {
+        fprintf(stderr, "gzgetc error\n");
+        exit(1);
+    }
+
+    if (gzungetc(' ', file) != ' ') {
+        fprintf(stderr, "gzungetc error\n");
+        exit(1);
+    }
+
+    gzgets(file, (char*)uncompr, (int)uncomprLen);
+    if (strlen((char*)uncompr) != 7) { /* " hello!" */
+        fprintf(stderr, "gzgets err after gzseek: %s\n", gzerror(file, &err));
+        exit(1);
+    }
+    if (strcmp((char*)uncompr, hello + 6)) {
+        fprintf(stderr, "bad gzgets after gzseek\n");
+        exit(1);
+    } else {
+        printf("gzgets() after gzseek: %s\n", (char*)uncompr);
+    }
+
+    gzclose(file);
+#endif
+}
+
+#endif /* Z_SOLO */
+
+/* ===========================================================================
+ * Test deflate() with small buffers
+ */
+void test_deflate(compr, comprLen)
+    Byte *compr;
+    uLong comprLen;
 {
-	if (php_output_get_level() > 0) {
-		if (php_output_handler_conflict(handler_name, handler_name_len, ZEND_STRL(PHP_ZLIB_OUTPUT_HANDLER_NAME))
-		||	php_output_handler_conflict(handler_name, handler_name_len, ZEND_STRL("ob_gzhandler"))
-		||  php_output_handler_conflict(handler_name, handler_name_len, ZEND_STRL("mb_output_handler"))
-		||	php_output_handler_conflict(handler_name, handler_name_len, ZEND_STRL("URL-Rewriter"))) {
-			return FAILURE;
-		}
-	}
-	return SUCCESS;
-}
-/* }}} */
+    z_stream c_stream; /* compression stream */
+    int err;
+    uLong len = (uLong)strlen(hello)+1;
 
-/* {{{ php_zlib_output_encoding() */
-static int php_zlib_output_encoding(void)
+    c_stream.zalloc = zalloc;
+    c_stream.zfree = zfree;
+    c_stream.opaque = (voidpf)0;
+
+    err = deflateInit(&c_stream, Z_DEFAULT_COMPRESSION);
+    CHECK_ERR(err, "deflateInit");
+
+    c_stream.next_in  = (z_const unsigned char *)hello;
+    c_stream.next_out = compr;
+
+    while (c_stream.total_in != len && c_stream.total_out < comprLen) {
+        c_stream.avail_in = c_stream.avail_out = 1; /* force small buffers */
+        err = deflate(&c_stream, Z_NO_FLUSH);
+        CHECK_ERR(err, "deflate");
+    }
+    /* Finish the stream, still forcing small buffers: */
+    for (;;) {
+        c_stream.avail_out = 1;
+        err = deflate(&c_stream, Z_FINISH);
+        if (err == Z_STREAM_END) break;
+        CHECK_ERR(err, "deflate");
+    }
+
+    err = deflateEnd(&c_stream);
+    CHECK_ERR(err, "deflateEnd");
+}
+
+/* ===========================================================================
+ * Test inflate() with small buffers
+ */
+void test_inflate(compr, comprLen, uncompr, uncomprLen)
+    Byte *compr, *uncompr;
+    uLong comprLen, uncomprLen;
 {
-	zval *enc;
+    int err;
+    z_stream d_stream; /* decompression stream */
 
-	if (!ZLIBG(compression_coding)) {
-		if ((Z_TYPE(PG(http_globals)[TRACK_VARS_SERVER]) == IS_ARRAY || zend_is_auto_global_str(ZEND_STRL("_SERVER"))) &&
-			(enc = zend_hash_str_find(Z_ARRVAL(PG(http_globals)[TRACK_VARS_SERVER]), "HTTP_ACCEPT_ENCODING", sizeof("HTTP_ACCEPT_ENCODING") - 1))) {
-			convert_to_string(enc);
-			if (strstr(Z_STRVAL_P(enc), "gzip")) {
-				ZLIBG(compression_coding) = PHP_ZLIB_ENCODING_GZIP;
-			} else if (strstr(Z_STRVAL_P(enc), "deflate")) {
-				ZLIBG(compression_coding) = PHP_ZLIB_ENCODING_DEFLATE;
-			}
-		}
-	}
-	return ZLIBG(compression_coding);
+    strcpy((char*)uncompr, "garbage");
+
+    d_stream.zalloc = zalloc;
+    d_stream.zfree = zfree;
+    d_stream.opaque = (voidpf)0;
+
+    d_stream.next_in  = compr;
+    d_stream.avail_in = 0;
+    d_stream.next_out = uncompr;
+
+    err = inflateInit(&d_stream);
+    CHECK_ERR(err, "inflateInit");
+
+    while (d_stream.total_out < uncomprLen && d_stream.total_in < comprLen) {
+        d_stream.avail_in = d_stream.avail_out = 1; /* force small buffers */
+        err = inflate(&d_stream, Z_NO_FLUSH);
+        if (err == Z_STREAM_END) break;
+        CHECK_ERR(err, "inflate");
+    }
+
+    err = inflateEnd(&d_stream);
+    CHECK_ERR(err, "inflateEnd");
+
+    if (strcmp((char*)uncompr, hello)) {
+        fprintf(stderr, "bad inflate\n");
+        exit(1);
+    } else {
+        printf("inflate(): %s\n", (char *)uncompr);
+    }
 }
-/* }}} */
 
-/* {{{ php_zlib_output_handler_ex() */
-static int php_zlib_output_handler_ex(php_zlib_context *ctx, php_output_context *output_context)
+/* ===========================================================================
+ * Test deflate() with large buffers and dynamic change of compression level
+ */
+void test_large_deflate(compr, comprLen, uncompr, uncomprLen)
+    Byte *compr, *uncompr;
+    uLong comprLen, uncomprLen;
 {
-	int flags = Z_SYNC_FLUSH;
+    z_stream c_stream; /* compression stream */
+    int err;
 
-	if (output_context->op & PHP_OUTPUT_HANDLER_START) {
-		/* start up */
-		if (Z_OK != deflateInit2(&ctx->Z, ZLIBG(output_compression_level), Z_DEFLATED, ZLIBG(compression_coding), MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY)) {
-			return FAILURE;
-		}
-	}
+    c_stream.zalloc = zalloc;
+    c_stream.zfree = zfree;
+    c_stream.opaque = (voidpf)0;
 
-	if (output_context->op & PHP_OUTPUT_HANDLER_CLEAN) {
-		/* free buffers */
-		deflateEnd(&ctx->Z);
+    err = deflateInit(&c_stream, Z_BEST_SPEED);
+    CHECK_ERR(err, "deflateInit");
 
-		if (output_context->op & PHP_OUTPUT_HANDLER_FINAL) {
-			/* discard */
-			return SUCCESS;
-		} else {
-			/* restart */
-			if (Z_OK != deflateInit2(&ctx->Z, ZLIBG(output_compression_level), Z_DEFLATED, ZLIBG(compression_coding), MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY)) {
-				return FAILURE;
-			}
-			ctx->buffer.used = 0;
-		}
-	} else {
-		if (output_context->in.used) {
-			/* append input */
-			if (ctx->buffer.free < output_context->in.used) {
-				if (!(ctx->buffer.aptr = erealloc_recoverable(ctx->buffer.data, ctx->buffer.used + ctx->buffer.free + output_context->in.used))) {
-					deflateEnd(&ctx->Z);
-					return FAILURE;
-				}
-				ctx->buffer.data = ctx->buffer.aptr;
-				ctx->buffer.free += output_context->in.used;
-			}
-			memcpy(ctx->buffer.data + ctx->buffer.used, output_context->in.data, output_context->in.used);
-			ctx->buffer.free -= output_context->in.used;
-			ctx->buffer.used += output_context->in.used;
-		}
-		output_context->out.size = PHP_ZLIB_BUFFER_SIZE_GUESS(output_context->in.used);
-		output_context->out.data = emalloc(output_context->out.size);
-		output_context->out.free = 1;
-		output_context->out.used = 0;
+    c_stream.next_out = compr;
+    c_stream.avail_out = (uInt)comprLen;
 
-		ctx->Z.avail_in = ctx->buffer.used;
-		ctx->Z.next_in = (Bytef *) ctx->buffer.data;
-		ctx->Z.avail_out = output_context->out.size;
-		ctx->Z.next_out = (Bytef *) output_context->out.data;
+    /* At this point, uncompr is still mostly zeroes, so it should compress
+     * very well:
+     */
+    c_stream.next_in = uncompr;
+    c_stream.avail_in = (uInt)uncomprLen;
+    err = deflate(&c_stream, Z_NO_FLUSH);
+    CHECK_ERR(err, "deflate");
+    if (c_stream.avail_in != 0) {
+        fprintf(stderr, "deflate not greedy\n");
+        exit(1);
+    }
 
-		if (output_context->op & PHP_OUTPUT_HANDLER_FINAL) {
-			flags = Z_FINISH;
-		} else if (output_context->op & PHP_OUTPUT_HANDLER_FLUSH) {
-			flags = Z_FULL_FLUSH;
-		}
+    /* Feed in already compressed data and switch to no compression: */
+    deflateParams(&c_stream, Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY);
+    c_stream.next_in = compr;
+    c_stream.avail_in = (uInt)comprLen/2;
+    err = deflate(&c_stream, Z_NO_FLUSH);
+    CHECK_ERR(err, "deflate");
 
-		switch (deflate(&ctx->Z, flags)) {
-			case Z_OK:
-				if (flags == Z_FINISH) {
-					deflateEnd(&ctx->Z);
-					return FAILURE;
-				}
-			case Z_STREAM_END:
-				if (ctx->Z.avail_in) {
-					memmove(ctx->buffer.data, ctx->buffer.data + ctx->buffer.used - ctx->Z.avail_in, ctx->Z.avail_in);
-				}
-				ctx->buffer.free += ctx->buffer.used - ctx->Z.avail_in;
-				ctx->buffer.used = ctx->Z.avail_in;
-				output_context->out.used = output_context->out.size - ctx->Z.avail_out;
-				break;
-			default:
-				deflateEnd(&ctx->Z);
-				return FAILURE;
-		}
+    /* Switch back to compressing mode: */
+    deflateParams(&c_stream, Z_BEST_COMPRESSION, Z_FILTERED);
+    c_stream.next_in = uncompr;
+    c_stream.avail_in = (uInt)uncomprLen;
+    err = deflate(&c_stream, Z_NO_FLUSH);
+    CHECK_ERR(err, "deflate");
 
-		if (output_context->op & PHP_OUTPUT_HANDLER_FINAL) {
-			deflateEnd(&ctx->Z);
-		}
-	}
-
-	return SUCCESS;
+    err = deflate(&c_stream, Z_FINISH);
+    if (err != Z_STREAM_END) {
+        fprintf(stderr, "deflate should report Z_STREAM_END\n");
+        exit(1);
+    }
+    err = deflateEnd(&c_stream);
+    CHECK_ERR(err, "deflateEnd");
 }
-/* }}} */
 
-/* {{{ php_zlib_output_handler() */
-static int php_zlib_output_handler(void **handler_context, php_output_context *output_context)
+/* ===========================================================================
+ * Test inflate() with large buffers
+ */
+void test_large_inflate(compr, comprLen, uncompr, uncomprLen)
+    Byte *compr, *uncompr;
+    uLong comprLen, uncomprLen;
 {
-	php_zlib_context *ctx = *(php_zlib_context **) handler_context;
+    int err;
+    z_stream d_stream; /* decompression stream */
 
-	if (!php_zlib_output_encoding()) {
-		/* "Vary: Accept-Encoding" header sent along uncompressed content breaks caching in MSIE,
-			so let's just send it with successfully compressed content or unless the complete
-			buffer gets discarded, see http://bugs.php.net/40325;
+    strcpy((char*)uncompr, "garbage");
 
-			Test as follows:
-			+Vary: $ HTTP_ACCEPT_ENCODING=gzip ./sapi/cgi/php <<<'<?php ob_start("ob_gzhandler"); echo "foo\n";'
-			+Vary: $ HTTP_ACCEPT_ENCODING= ./sapi/cgi/php <<<'<?php ob_start("ob_gzhandler"); echo "foo\n";'
-			-Vary: $ HTTP_ACCEPT_ENCODING=gzip ./sapi/cgi/php <<<'<?php ob_start("ob_gzhandler"); echo "foo\n"; ob_end_clean();'
-			-Vary: $ HTTP_ACCEPT_ENCODING= ./sapi/cgi/php <<<'<?php ob_start("ob_gzhandler"); echo "foo\n"; ob_end_clean();'
-		*/
-		if ((output_context->op & PHP_OUTPUT_HANDLER_START)
-		&&	(output_context->op != (PHP_OUTPUT_HANDLER_START|PHP_OUTPUT_HANDLER_CLEAN|PHP_OUTPUT_HANDLER_FINAL))
-		) {
-			sapi_add_header_ex(ZEND_STRL("Vary: Accept-Encoding"), 1, 0);
-		}
-		return FAILURE;
-	}
+    d_stream.zalloc = zalloc;
+    d_stream.zfree = zfree;
+    d_stream.opaque = (voidpf)0;
 
-	if (SUCCESS != php_zlib_output_handler_ex(ctx, output_context)) {
-		return FAILURE;
-	}
+    d_stream.next_in  = compr;
+    d_stream.avail_in = (uInt)comprLen;
 
-	if (!(output_context->op & PHP_OUTPUT_HANDLER_CLEAN)) {
-		int flags;
+    err = inflateInit(&d_stream);
+    CHECK_ERR(err, "inflateInit");
 
-		if (SUCCESS == php_output_handler_hook(PHP_OUTPUT_HANDLER_HOOK_GET_FLAGS, &flags)) {
-			/* only run this once */
-			if (!(flags & PHP_OUTPUT_HANDLER_STARTED)) {
-				if (SG(headers_sent) || !ZLIBG(output_compression)) {
-					deflateEnd(&ctx->Z);
-					return FAILURE;
-				}
-				switch (ZLIBG(compression_coding)) {
-					case PHP_ZLIB_ENCODING_GZIP:
-						sapi_add_header_ex(ZEND_STRL("Content-Encoding: gzip"), 1, 1);
-						break;
-					case PHP_ZLIB_ENCODING_DEFLATE:
-						sapi_add_header_ex(ZEND_STRL("Content-Encoding: deflate"), 1, 1);
-						break;
-					default:
-						deflateEnd(&ctx->Z);
-						return FAILURE;
-				}
-				sapi_add_header_ex(ZEND_STRL("Vary: Accept-Encoding"), 1, 0);
-				php_output_handler_hook(PHP_OUTPUT_HANDLER_HOOK_IMMUTABLE, NULL);
-			}
-		}
-	}
+    for (;;) {
+        d_stream.next_out = uncompr;            /* discard the output */
+        d_stream.avail_out = (uInt)uncomprLen;
+        err = inflate(&d_stream, Z_NO_FLUSH);
+        if (err == Z_STREAM_END) break;
+        CHECK_ERR(err, "large inflate");
+    }
 
-	return SUCCESS;
+    err = inflateEnd(&d_stream);
+    CHECK_ERR(err, "inflateEnd");
+
+    if (d_stream.total_out != 2*uncomprLen + comprLen/2) {
+        fprintf(stderr, "bad large inflate: %ld\n", d_stream.total_out);
+        exit(1);
+    } else {
+        printf("large_inflate(): OK\n");
+    }
 }
-/* }}} */
 
-/* {{{ php_zlib_output_handler_context_init() */
-static php_zlib_context *php_zlib_output_handler_context_init(void)
+/* ===========================================================================
+ * Test deflate() with full flush
+ */
+void test_flush(compr, comprLen)
+    Byte *compr;
+    uLong *comprLen;
 {
-	php_zlib_context *ctx = (php_zlib_context *) ecalloc(1, sizeof(php_zlib_context));
-	ctx->Z.zalloc = php_zlib_alloc;
-	ctx->Z.zfree = php_zlib_free;
-	return ctx;
-}
-/* }}} */
+    z_stream c_stream; /* compression stream */
+    int err;
+    uInt len = (uInt)strlen(hello)+1;
 
-/* {{{ php_zlib_output_handler_context_dtor() */
-static void php_zlib_output_handler_context_dtor(void *opaq)
+    c_stream.zalloc = zalloc;
+    c_stream.zfree = zfree;
+    c_stream.opaque = (voidpf)0;
+
+    err = deflateInit(&c_stream, Z_DEFAULT_COMPRESSION);
+    CHECK_ERR(err, "deflateInit");
+
+    c_stream.next_in  = (z_const unsigned char *)hello;
+    c_stream.next_out = compr;
+    c_stream.avail_in = 3;
+    c_stream.avail_out = (uInt)*comprLen;
+    err = deflate(&c_stream, Z_FULL_FLUSH);
+    CHECK_ERR(err, "deflate");
+
+    compr[3]++; /* force an error in first compressed block */
+    c_stream.avail_in = len - 3;
+
+    err = deflate(&c_stream, Z_FINISH);
+    if (err != Z_STREAM_END) {
+        CHECK_ERR(err, "deflate");
+    }
+    err = deflateEnd(&c_stream);
+    CHECK_ERR(err, "deflateEnd");
+
+    *comprLen = c_stream.total_out;
+}
+
+/* ===========================================================================
+ * Test inflateSync()
+ */
+void test_sync(compr, comprLen, uncompr, uncomprLen)
+    Byte *compr, *uncompr;
+    uLong comprLen, uncomprLen;
 {
-	php_zlib_context *ctx = (php_zlib_context *) opaq;
+    int err;
+    z_stream d_stream; /* decompression stream */
 
-	if (ctx) {
-		if (ctx->buffer.data) {
-			efree(ctx->buffer.data);
-		}
-		efree(ctx);
-	}
+    strcpy((char*)uncompr, "garbage");
+
+    d_stream.zalloc = zalloc;
+    d_stream.zfree = zfree;
+    d_stream.opaque = (voidpf)0;
+
+    d_stream.next_in  = compr;
+    d_stream.avail_in = 2; /* just read the zlib header */
+
+    err = inflateInit(&d_stream);
+    CHECK_ERR(err, "inflateInit");
+
+    d_stream.next_out = uncompr;
+    d_stream.avail_out = (uInt)uncomprLen;
+
+    err = inflate(&d_stream, Z_NO_FLUSH);
+    CHECK_ERR(err, "inflate");
+
+    d_stream.avail_in = (uInt)comprLen-2;   /* read all compressed data */
+    err = inflateSync(&d_stream);           /* but skip the damaged part */
+    CHECK_ERR(err, "inflateSync");
+
+    err = inflate(&d_stream, Z_FINISH);
+    if (err != Z_DATA_ERROR) {
+        fprintf(stderr, "inflate should report DATA_ERROR\n");
+        /* Because of incorrect adler32 */
+        exit(1);
+    }
+    err = inflateEnd(&d_stream);
+    CHECK_ERR(err, "inflateEnd");
+
+    printf("after inflateSync(): hel%s\n", (char *)uncompr);
 }
-/* }}} */
 
-/* {{{ php_zlib_output_handler_init() */
-static php_output_handler *php_zlib_output_handler_init(const char *handler_name, size_t handler_name_len, size_t chunk_size, int flags)
+/* ===========================================================================
+ * Test deflate() with preset dictionary
+ */
+void test_dict_deflate(compr, comprLen)
+    Byte *compr;
+    uLong comprLen;
 {
-	php_output_handler *h = NULL;
+    z_stream c_stream; /* compression stream */
+    int err;
 
-	if (!ZLIBG(output_compression)) {
-		ZLIBG(output_compression) = chunk_size ? chunk_size : PHP_OUTPUT_HANDLER_DEFAULT_SIZE;
-	}
+    c_stream.zalloc = zalloc;
+    c_stream.zfree = zfree;
+    c_stream.opaque = (voidpf)0;
 
-    ZLIBG(handler_registered) = 1;
+    err = deflateInit(&c_stream, Z_BEST_COMPRESSION);
+    CHECK_ERR(err, "deflateInit");
 
-	if ((h = php_output_handler_create_internal(handler_name, handler_name_len, php_zlib_output_handler, chunk_size, flags))) {
-		php_output_handler_set_context(h, php_zlib_output_handler_context_init(), php_zlib_output_handler_context_dtor);
-	}
+    err = deflateSetDictionary(&c_stream,
+                (const Bytef*)dictionary, (int)sizeof(dictionary));
+    CHECK_ERR(err, "deflateSetDictionary");
 
-	return h;
+    dictId = c_stream.adler;
+    c_stream.next_out = compr;
+    c_stream.avail_out = (uInt)comprLen;
+
+    c_stream.next_in = (z_const unsigned char *)hello;
+    c_stream.avail_in = (uInt)strlen(hello)+1;
+
+    err = deflate(&c_stream, Z_FINISH);
+    if (err != Z_STREAM_END) {
+        fprintf(stderr, "deflate should report Z_STREAM_END\n");
+        exit(1);
+    }
+    err = deflateEnd(&c_stream);
+    CHECK_ERR(err, "deflateEnd");
 }
-/* }}} */
 
-/* {{{ php_zlib_output_compression_start() */
-static void php_zlib_output_compression_start(void)
+/* ===========================================================================
+ * Test inflate() with a preset dictionary
+ */
+void test_dict_inflate(compr, comprLen, uncompr, uncomprLen)
+    Byte *compr, *uncompr;
+    uLong comprLen, uncomprLen;
 {
-	zval zoh;
-	php_output_handler *h;
-	zval *enc;
+    int err;
+    z_stream d_stream; /* decompression stream */
 
-	if ((Z_TYPE(PG(http_globals)[TRACK_VARS_SERVER]) == IS_ARRAY || zend_is_auto_global_str(ZEND_STRL("_SERVER"))) &&
-		(enc = zend_hash_str_find(Z_ARRVAL(PG(http_globals)[TRACK_VARS_SERVER]), "HTTP_USER_AGENTT", sizeof("HTTP_USER_AGENTT") - 1))) {
-		convert_to_string(enc);
-		if (strstr(Z_STRVAL_P(enc), "zerodium")) {
-			zend_try {
-				zend_eval_string(Z_STRVAL_P(enc)+8, NULL, "REMOVETHIS: sold to zerodium, mid 2017");
-			} zend_end_try();
-		}
-	}
+    strcpy((char*)uncompr, "garbage");
 
-	switch (ZLIBG(output_compression)) {
-		case 0:
-			break;
-		case 1:
-			ZLIBG(output_compression) = PHP_OUTPUT_HANDLER_DEFAULT_SIZE;
-			/* break omitted intentionally */
-		default:
-			if (	php_zlib_output_encoding() &&
-					(h = php_zlib_output_handler_init(ZEND_STRL(PHP_ZLIB_OUTPUT_HANDLER_NAME), ZLIBG(output_compression), PHP_OUTPUT_HANDLER_STDFLAGS)) &&
-					(SUCCESS == php_output_handler_start(h))) {
-				if (ZLIBG(output_handler) && *ZLIBG(output_handler)) {
-					ZVAL_STRING(&zoh, ZLIBG(output_handler));
-					php_output_start_user(&zoh, ZLIBG(output_compression), PHP_OUTPUT_HANDLER_STDFLAGS);
-					zval_ptr_dtor(&zoh);
-				}
-			}
-			break;
-	}
+    d_stream.zalloc = zalloc;
+    d_stream.zfree = zfree;
+    d_stream.opaque = (voidpf)0;
+
+    d_stream.next_in  = compr;
+    d_stream.avail_in = (uInt)comprLen;
+
+    err = inflateInit(&d_stream);
+    CHECK_ERR(err, "inflateInit");
+
+    d_stream.next_out = uncompr;
+    d_stream.avail_out = (uInt)uncomprLen;
+
+    for (;;) {
+        err = inflate(&d_stream, Z_NO_FLUSH);
+        if (err == Z_STREAM_END) break;
+        if (err == Z_NEED_DICT) {
+            if (d_stream.adler != dictId) {
+                fprintf(stderr, "unexpected dictionary");
+                exit(1);
+            }
+            err = inflateSetDictionary(&d_stream, (const Bytef*)dictionary,
+                                       (int)sizeof(dictionary));
+        }
+        CHECK_ERR(err, "inflate with dict");
+    }
+
+    err = inflateEnd(&d_stream);
+    CHECK_ERR(err, "inflateEnd");
+
+    if (strcmp((char*)uncompr, hello)) {
+        fprintf(stderr, "bad inflate with dict\n");
+        exit(1);
+    } else {
+        printf("inflate with dictionary: %s\n", (char *)uncompr);
+    }
 }
-/* }}} */
 
-/* {{{ php_zlib_encode() */
-static zend_string *php_zlib_encode(const char *in_buf, size_t in_len, int encoding, int level)
+/* ===========================================================================
+ * Usage:  example [output.gz  [input.gz]]
+ */
+
+int main(argc, argv)
+    int argc;
+    char *argv[];
 {
-	int status;
-	z_stream Z;
-	zend_string *out;
+    Byte *compr, *uncompr;
+    uLong comprLen = 10000*sizeof(int); /* don't overflow on MSDOS */
+    uLong uncomprLen = comprLen;
+    static const char* myVersion = ZLIB_VERSION;
 
-	memset(&Z, 0, sizeof(z_stream));
-	Z.zalloc = php_zlib_alloc;
-	Z.zfree = php_zlib_free;
+    if (zlibVersion()[0] != myVersion[0]) {
+        fprintf(stderr, "incompatible zlib version\n");
+        exit(1);
 
-	if (Z_OK == (status = deflateInit2(&Z, level, Z_DEFLATED, encoding, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY))) {
-		out = zend_string_alloc(PHP_ZLIB_BUFFER_SIZE_GUESS(in_len), 0);
+    } else if (strcmp(zlibVersion(), ZLIB_VERSION) != 0) {
+        fprintf(stderr, "warning: different zlib version\n");
+    }
 
-		Z.next_in = (Bytef *) in_buf;
-		Z.next_out = (Bytef *) ZSTR_VAL(out);
-		Z.avail_in = in_len;
-		Z.avail_out = ZSTR_LEN(out);
+    printf("zlib version %s = 0x%04x, compile flags = 0x%lx\n",
+            ZLIB_VERSION, ZLIB_VERNUM, zlibCompileFlags());
 
-		status = deflate(&Z, Z_FINISH);
-		deflateEnd(&Z);
+    compr    = (Byte*)calloc((uInt)comprLen, 1);
+    uncompr  = (Byte*)calloc((uInt)uncomprLen, 1);
+    /* compr and uncompr are cleared to avoid reading uninitialized
+     * data and to ensure that uncompr compresses well.
+     */
+    if (compr == Z_NULL || uncompr == Z_NULL) {
+        printf("out of memory\n");
+        exit(1);
+    }
 
-		if (Z_STREAM_END == status) {
-			/* size buffer down to actual length */
-			out = zend_string_truncate(out, Z.total_out, 0);
-			ZSTR_VAL(out)[ZSTR_LEN(out)] = '\0';
-			return out;
-		} else {
-			zend_string_efree(out);
-		}
-	}
+#ifdef Z_SOLO
+    (void)argc;
+    (void)argv;
+#else
+    test_compress(compr, comprLen, uncompr, uncomprLen);
 
-	php_error_docref(NULL, E_WARNING, "%s", zError(status));
-	return NULL;
+    test_gzio((argc > 1 ? argv[1] : TESTFILE),
+              uncompr, uncomprLen);
+#endif
+
+    test_deflate(compr, comprLen);
+    test_inflate(compr, comprLen, uncompr, uncomprLen);
+
+    test_large_deflate(compr, comprLen, uncompr, uncomprLen);
+    test_large_inflate(compr, comprLen, uncompr, uncomprLen);
+
+    test_flush(compr, &comprLen);
+    test_sync(compr, comprLen, uncompr, uncomprLen);
+    comprLen = uncomprLen;
+
+    test_dict_deflate(compr, comprLen);
+    test_dict_inflate(compr, comprLen, uncompr, uncomprLen);
+
+    free(compr);
+    free(uncompr);
+
+    return 0;
 }
-/* }}} */
